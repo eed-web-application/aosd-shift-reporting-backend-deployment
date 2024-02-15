@@ -1,0 +1,126 @@
+name: Build Test And Create
+on: 
+  workflow_call:
+      secrets:
+          token:
+              required: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+jobs:
+    build_and_test:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v3  # Check out your project code
+        - name: Use Node.js # Setup Node (with matrix support)
+          uses: actions/setup-node@v3
+          with:
+            node-version: 21.x
+
+        - name: Install dependencies
+          run: npm ci
+
+        - name: Check for Test Files
+          id: check-tests
+          run: |
+            if [ -d test ] && (
+                ls test/*.test.js >/dev/null 2>&1 || 
+                ls test/**/*.test.js >/dev/null 2>&1
+                ); then
+                echo "Tests found, setting run_tests to true."
+                echo "RUN_TESTS=true" >> $GITHUB_ENV
+            else
+                echo "No tests found, setting run_tests to false."
+                echo "RUN_TESTS=false" >> $GITHUB_ENV
+            fi
+         
+        - name: Check for docker-compose.yml file
+          uses: andstor/file-existence-action@v2
+          id: check_files
+          with:
+            files: "docker-compose.yml"
+
+        - name: Start test backend
+          if: steps.check_files.outputs.files_exists == 'true'
+          run: |
+            docker compose -f docker-compose.yml up -d
+            sleep 5
+
+        - name: Test Project
+          if: env.RUN_TESTS == 'true'
+          run: npm test 
+
+        - name: Shoutdown test backend
+          if: steps.check_files.outputs.files_exists == 'true' &&  (success() || failure())
+          run: |
+            docker compose -f docker-compose.yml logs
+            docker compose -f docker-compose.yml down -v
+
+    build-docker-images:
+      name: Build and Publish Docker Image
+      runs-on: ubuntu-latest
+      needs: build_and_test
+      outputs:
+        IMAGE_TO_DEPLOY: ${{ steps.meta.outputs.tags }}
+      steps:
+        - name: Checkout source code
+          uses: actions/checkout@v3
+          with:
+            fetch-depth: 0
+        - name: Install GitVersion
+          uses: gittools/actions/gitversion/setup@v0
+          with:
+            versionSpec: '5.x'
+        - name: Determine Version
+          id: gitversion
+          uses: gittools/actions/gitversion/execute@v0
+          with:
+            useConfigFile: false
+        - name: Manage Version
+          run: |
+            echo "Writing version \"$GitVersion_Major.$GitVersion_Minor.$GitVersion_Patch\" to src/version.js"
+            echo "export const VERSION = '$GitVersion_Major.$GitVersion_Minor.$GitVersion_Patch';" > src/version.js
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v2
+        - name: Log in to the Container registry
+          uses: docker/login-action@v2
+          with:
+            registry: ${{ env.REGISTRY }}
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+        - name: Docker Metadata
+          id: meta
+          uses: docker/metadata-action@v4
+          with:
+            # list of Docker images to use as base name for tags
+            images: ${{env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            # generate Docker tags based on the following events/attributes
+            tags: |
+              type=sha
+            labels: |
+              maintainer=bisegni@slac.stanford.edu
+        - name: Build and push Docker image
+          uses: docker/build-push-action@v4
+          id: build_and_push
+          with:
+            context: .
+            file: ./Dockerfile
+            platforms: |
+              linux/amd64
+              linux/arm64/v8
+            provenance: false
+            push: true
+            tags: ${{ steps.meta.outputs.tags }}
+            labels: ${{ steps.meta.outputs.labels }}
+    deploy:
+        name: Start Deployment
+        runs-on: ubuntu-latest
+        needs: build-docker-images
+        steps:
+          - run: |
+                gh workflow --repo eed-web-application/nodejs-test-backend-deployment run Deployment -f deployment_image="${{needs.build-docker-images.outputs.IMAGE_TO_DEPLOY}} "
+            env:
+                GITHUB_TOKEN: ${{ secrets.TRIGGER_WORKFLOW_SECRET }}

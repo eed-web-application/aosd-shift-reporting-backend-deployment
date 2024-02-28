@@ -20,7 +20,7 @@ spec:
       containers:
       - name: aosd-shift-reporting-backend
         imagePullPolicy: Always
-        image: ghcr.io/eed-web-application/aosd-shift-reporting-backend:sha-6f23ec5
+        image: ghcr.io/eed-web-application/aosd-shift-reporting-backend:sha-73b5cef
         envFrom:
         - configMapRef:
             name: env-config-map
